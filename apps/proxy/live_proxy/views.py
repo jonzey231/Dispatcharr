@@ -6,7 +6,6 @@ import pathlib
 from django.http import StreamingHttpResponse, JsonResponse, HttpResponseRedirect, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.shortcuts import get_object_or_404
-from django.urls import reverse
 from .server import ProxyServer
 from .channel_status import ChannelStatus
 from .output.ts.generator import create_stream_generator
@@ -569,8 +568,10 @@ def stream_ts(request, channel_id, user=None, force_output_format=None):
                 channel_id, resolved_format,
                 source_buffer=source_buffer if output_profile else None,
             )
+            # Hardcoded mount path, matching how generate_m3u builds
+            # /proxy/ts/stream/ URLs (apps/output/views.py).
             return HttpResponseRedirect(
-                reverse('live_proxy:hls_playlist', args=[channel_id, client_id])
+                f"/proxy/ts/hls/{channel_id}/{client_id}/index.m3u8"
             )
         elif output_format == 'fmp4':
             proxy_server.ensure_output_format(
