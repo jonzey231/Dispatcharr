@@ -571,7 +571,7 @@ def stream_ts(request, channel_id, user=None, force_output_format=None):
             # Hardcoded mount path, matching how generate_m3u builds
             # /proxy/ts/stream/ URLs (apps/output/views.py).
             return HttpResponseRedirect(
-                f"/proxy/ts/hls/{channel_id}/{client_id}/index.m3u8"
+                f"/proxy/hls/{channel_id}/{client_id}/index.m3u8"
             )
         elif output_format == 'fmp4':
             proxy_server.ensure_output_format(

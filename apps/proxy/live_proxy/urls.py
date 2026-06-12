@@ -11,6 +11,4 @@ urlpatterns = [
     path('stop/<str:channel_id>', views.stop_channel, name='stop_channel'),
     path('stop_client/<str:channel_id>', views.stop_client, name='stop_client'),
     path('next_stream/<str:channel_id>', views.next_stream, name='next_stream'),
-    path('hls/<str:channel_id>/<str:client_id>/index.m3u8', views.hls_playlist, name='hls_playlist'),
-    path('hls/<str:channel_id>/<str:client_id>/seg_<int:seq>.ts', views.hls_segment, name='hls_segment'),
 ]

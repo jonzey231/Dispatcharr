@@ -318,7 +318,7 @@ class TSSegmenter:
         return segment
 
 
-def render_media_playlist(window, target_duration, segment_name="seg_{seq}.ts"):
+def render_media_playlist(window, target_duration, segment_name="{seq}.ts"):
     """
     Render an HLS media playlist (RFC 8216, version 3) from a window of
     segment descriptors: [{"seq": int, "dur": float, "disc": bool}, ...].

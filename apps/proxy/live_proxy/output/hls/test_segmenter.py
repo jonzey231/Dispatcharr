@@ -198,11 +198,11 @@ class PlaylistTests(unittest.TestCase):
         self.assertIn("#EXT-X-TARGETDURATION:5", text)       # ceil(4.2)
         self.assertIn("#EXT-X-MEDIA-SEQUENCE:7", text)
         self.assertIn("#EXTINF:4.200,", text)
-        self.assertIn("seg_8.ts", text)
+        self.assertIn("8.ts", text)
         self.assertNotIn("#EXT-X-ENDLIST", text)             # live
         # Discontinuity tag must precede its segment
         lines = text.splitlines()
-        self.assertEqual(lines[lines.index("#EXT-X-DISCONTINUITY") + 2], "seg_9.ts")
+        self.assertEqual(lines[lines.index("#EXT-X-DISCONTINUITY") + 2], "9.ts")
 
     def test_render_empty_window(self):
         text = render_media_playlist([], 4)
