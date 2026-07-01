@@ -8,6 +8,8 @@ Django/Redis), so they run standalone:
 import unittest
 
 from .segmenter import (
+    Part,
+    Segment,
     TSSegmenter,
     TS_PACKET_SIZE,
     extract_pts,
@@ -214,6 +216,70 @@ class PlaylistTests(unittest.TestCase):
         self.assertIn("#EXT-X-INDEPENDENT-SEGMENTS", text)
         self.assertIn("#EXT-X-TARGETDURATION:4", text)       # ceil(4)
         self.assertNotIn("#EXT-X-START", text)               # no segments to offset from
+
+    def test_render_low_latency(self):
+        window = [
+            {"seq": 5, "dur": 4.0, "disc": False},
+            {"seq": 6, "dur": 4.1, "disc": False},
+        ]
+        parts_by_seq = {"6": [[0.5, True], [0.5, False]]}
+        building = {"seq": 7, "parts": [[0.5, True], [0.4, False]]}
+        text = render_media_playlist(
+            window, 4, part_target=0.5, parts_by_seq=parts_by_seq, building=building
+        )
+        self.assertIn("#EXT-X-VERSION:10", text)
+        self.assertIn("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=", text)
+        self.assertIn("#EXT-X-PART-INF:PART-TARGET=", text)
+        # Parts of the last completed segment, with the first marked independent.
+        self.assertIn('#EXT-X-PART:DURATION=0.50000,URI="p6.0.ts",INDEPENDENT=YES', text)
+        self.assertIn('#EXT-X-PART:DURATION=0.50000,URI="p6.1.ts"', text)
+        # In-progress segment's parts + a preload hint for the next part.
+        self.assertIn('#EXT-X-PART:DURATION=0.50000,URI="p7.0.ts",INDEPENDENT=YES', text)
+        self.assertIn('#EXT-X-PRELOAD-HINT:TYPE=PART,URI="p7.2.ts"', text)
+        # The completed segments are still present for non-LL clients.
+        self.assertIn("6.ts", text)
+        # Same call without part_target stays a plain version-3 playlist.
+        self.assertIn("#EXT-X-VERSION:3", render_media_playlist(window, 4))
+
+
+class PartTests(unittest.TestCase):
+    def _feed(self, seg, frames):
+        events = []
+        seg.feed(make_pat())
+        seg.feed(make_pmt())
+        for pts, keyframe in frames:
+            events.extend(seg.feed(make_video_pes(pts, keyframe=keyframe)))
+        return events
+
+    def test_parts_tile_the_segment(self):
+        seg = TSSegmenter(target_duration=4.0, part_target=0.5)
+        frames = [(0.0, True)]
+        t = 0.25
+        while t < 4.0:
+            frames.append((round(t, 2), False))
+            t += 0.25
+        frames.append((4.0, True))  # keyframe at/after target cuts the segment
+        events = self._feed(seg, frames)
+
+        parts = [e for e in events if isinstance(e, Part)]
+        segments = [e for e in events if isinstance(e, Segment)]
+        self.assertEqual(len(segments), 1)
+        # ~8 parts of ~0.5s span the 4s segment (including the final tail part).
+        self.assertGreaterEqual(len(parts), 6)
+        # Only the first part carries the keyframe + PAT/PMT.
+        self.assertTrue(parts[0].independent)
+        self.assertFalse(parts[1].independent)
+        # A segment's parts concatenate exactly to the segment bytes.
+        self.assertEqual(b"".join(p.data for p in parts), segments[0].data)
+        for p in parts:
+            self.assertLessEqual(p.duration, 2 * 0.5)  # bounded near part_target
+
+    def test_part_target_zero_emits_only_segments(self):
+        seg = TSSegmenter(target_duration=4.0)  # part_target defaults to 0
+        frames = [(0.0, True), (2.0, False), (4.0, True)]
+        events = self._feed(seg, frames)
+        self.assertTrue(all(isinstance(e, Segment) for e in events))
+        self.assertEqual(len(events), 1)
 
 
 class VideoCodecTests(unittest.TestCase):

@@ -17,7 +17,7 @@ import time
 
 from core.utils import RedisClient
 from ..fmp4.buffer import FMP4StreamBuffer
-from .segmenter import TSSegmenter
+from .segmenter import TSSegmenter, Segment, Part
 from ...redis_keys import RedisKeys
 from ...config_helper import ConfigHelper
 from ...utils import get_logger
@@ -42,6 +42,18 @@ DEFAULT_SEGMENT_DURATION = 4
 # proved too tight for AVPlayer after a stall (CoreMedia -12938 / HTTP 404).
 DEFAULT_WINDOW_SIZE = 10
 
+# Low-Latency HLS partial-segment target (seconds). 0 disables LL-HLS
+# (segments only). ~0.5s parts put the live edge within ~1.5s (PART-HOLD-BACK
+# = 3 x PART-TARGET) for players that support Blocking Playlist Reload, while
+# non-LL players ignore the part tags and use the whole segments unchanged.
+DEFAULT_PART_TARGET = 0.5
+# Parts live only near the live edge; the whole-segment chunk serves any
+# catch-up fetch, so parts can expire quickly.
+PART_KEY_TTL = 15
+# How many recent segments keep their parts in the descriptor (parts older
+# than PART-HOLD-BACK are not needed; a small tail bounds the descriptor size).
+PARTS_RETAINED_SEGMENTS = 3
+
 
 class HLSOutputManager:
     """
@@ -59,6 +71,7 @@ class HLSOutputManager:
 
         self.segment_duration = ConfigHelper.get('HLS_SEGMENT_DURATION', DEFAULT_SEGMENT_DURATION)
         self.window_size = ConfigHelper.get('HLS_WINDOW_SIZE', DEFAULT_WINDOW_SIZE)
+        self.part_target = ConfigHelper.get('HLS_PART_TARGET', DEFAULT_PART_TARGET)
 
         # Same Redis-backed chunk store the fMP4 manager uses; it is
         # format-parameterized by design ("adding a new output format only
@@ -74,6 +87,14 @@ class HLSOutputManager:
         # the playlist view can advertise it and refuse formats a client
         # cannot decode (HEVC-in-TS).
         self._video_codec = None
+        # Low-Latency HLS part state. _building_seq is the media sequence the
+        # in-progress segment will get when stored (put_fragment INCRs, so it is
+        # the current index + 1); _building_parts accumulates [dur, independent]
+        # for that segment; _parts_by_seq keeps a small tail of completed
+        # segments' parts for the descriptor.
+        self._building_seq = None
+        self._building_parts = []
+        self._parts_by_seq = {}
 
     # ------------------------------------------------------------------
     # Public API (same surface as FMP4RemuxManager)
@@ -123,7 +144,10 @@ class HLSOutputManager:
 
     def _segmenter_loop(self):
         """Read TS chunks from Redis and feed them through the segmenter."""
-        segmenter = TSSegmenter(target_duration=self.segment_duration)
+        segmenter = TSSegmenter(
+            target_duration=self.segment_duration,
+            part_target=self.part_target,
+        )
 
         # Start behind live so the first segments cover the same window a
         # new TS client would receive, matching fMP4 writer positioning.
@@ -147,15 +171,18 @@ class HLSOutputManager:
                     for chunk in chunks:
                         if not self.running:
                             break
-                        for segment in segmenter.feed(chunk):
+                        for event in segmenter.feed(chunk):
                             self._video_codec = segmenter.video_codec
-                            self._store_segment(segment)
+                            if isinstance(event, Part):
+                                self._store_part(event)
+                                continue
+                            self._store_segment(event)
                             if not first_segment_stored:
                                 first_segment_stored = True
                                 self._set_state(HLS_STATE_ACTIVE)
                                 logger.info(
                                     f"[HLS:{self.channel_id}] First segment stored "
-                                    f"({segment.duration:.2f}s, {len(segment.data)} bytes)"
+                                    f"({event.duration:.2f}s, {len(event.data)} bytes)"
                                 )
                 else:
                     if self.ts_buffer.index > local_index + 20:
@@ -173,6 +200,32 @@ class HLSOutputManager:
         finally:
             logger.debug(f"[HLS:{self.channel_id}] Segmenter loop exited")
 
+    def _store_part(self, part):
+        """Store one Low-Latency HLS partial segment for the in-progress segment
+        and refresh the descriptor so the live edge advances every ~part_target."""
+        if self.part_target <= 0:
+            return
+        if self._building_seq is None:
+            # The in-progress segment takes the next media sequence number
+            # (put_fragment INCRs the index when it is eventually stored).
+            self._building_seq = self.segment_buffer.index + 1
+        part_index = len(self._building_parts)
+        # Store parts in the same buffer Redis as the segment chunks so the part
+        # view reads them exactly like hls_segment reads chunks.
+        buf = self.segment_buffer.redis_client
+        if buf:
+            try:
+                buf.setex(
+                    RedisKeys.output_part(self.channel_id, self.fmt, self._building_seq, part_index),
+                    PART_KEY_TTL,
+                    part.data,
+                )
+            except Exception as e:
+                logger.error(f"[HLS:{self.channel_id}] Error storing part: {e}")
+                return
+        self._building_parts.append([round(part.duration, 5), bool(part.independent)])
+        self._publish_playlist_state()
+
     def _store_segment(self, segment):
         """Store one finished segment and refresh the playlist descriptor."""
         if not self.segment_buffer.put_fragment(segment.data):
@@ -186,26 +239,49 @@ class HLSOutputManager:
         if len(self._window) > self.window_size:
             self._window = self._window[-self.window_size:]
 
-        if self._redis:
-            try:
-                playlist_state = {
-                    "window": self._window,
-                    "target": self.segment_duration,
-                    "vcodec": self._video_codec,
-                }
-                self._redis.setex(
-                    RedisKeys.output_playlist(self.channel_id, self.fmt),
-                    HLS_KEY_TTL,
-                    json.dumps(playlist_state),
-                )
-            except Exception as e:
-                logger.error(f"[HLS:{self.channel_id}] Error updating playlist state: {e}")
+        # The parts accumulated while building now belong to this completed
+        # segment (its seq equals the seq tracked during building). Hand them
+        # over, start a fresh in-progress segment, and prune old parts.
+        if self.part_target > 0:
+            self._parts_by_seq[str(seq)] = self._building_parts
+            self._building_parts = []
+            self._building_seq = self.segment_buffer.index + 1
+            keep = {str(e["seq"]) for e in self._window[-PARTS_RETAINED_SEGMENTS:]}
+            self._parts_by_seq = {k: v for k, v in self._parts_by_seq.items() if k in keep}
+
+        self._publish_playlist_state()
 
         logger.debug(
             f"[HLS:{self.channel_id}] Segment {seq}: "
             f"{segment.duration:.2f}s, {len(segment.data)} bytes"
             f"{' [discontinuity]' if segment.discontinuity else ''}"
         )
+
+    def _publish_playlist_state(self):
+        """Write the rolling playlist descriptor to Redis for the playlist view
+        to render on demand. Includes LL-HLS part data when enabled."""
+        if not self._redis:
+            return
+        try:
+            playlist_state = {
+                "window": self._window,
+                "target": self.segment_duration,
+                "vcodec": self._video_codec,
+            }
+            if self.part_target > 0:
+                playlist_state["part_target"] = self.part_target
+                playlist_state["parts"] = self._parts_by_seq
+                playlist_state["building"] = {
+                    "seq": self._building_seq,
+                    "parts": self._building_parts,
+                }
+            self._redis.setex(
+                RedisKeys.output_playlist(self.channel_id, self.fmt),
+                HLS_KEY_TTL,
+                json.dumps(playlist_state),
+            )
+        except Exception as e:
+            logger.error(f"[HLS:{self.channel_id}] Error updating playlist state: {e}")
 
     # ------------------------------------------------------------------
     # Redis helpers (mirror FMP4RemuxManager)

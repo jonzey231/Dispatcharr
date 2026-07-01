@@ -135,3 +135,10 @@ class RedisKeys:
         """Sorted set mapping fragment receive-timestamps to fragment indices."""
         return f"live:channel:{channel_id}:output:{fmt}:buffer:chunk_timestamps"
 
+    @staticmethod
+    def output_part(channel_id, fmt, seq, part_index):
+        """One Low-Latency HLS partial segment (a sub-slice of segment ``seq``).
+        Short-lived: parts are only needed near the live edge, then the whole
+        segment chunk serves any catch-up fetch."""
+        return f"live:channel:{channel_id}:output:{fmt}:part:{seq}:{part_index}"
+

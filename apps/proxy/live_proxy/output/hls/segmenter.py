@@ -48,6 +48,22 @@ class Segment:
         self.discontinuity = discontinuity
 
 
+class Part:
+    """One Low-Latency HLS partial segment: a sub-second slice of the
+    in-progress segment, emitted before the segment closes so a client can
+    play within a part or two of the live edge. The concatenation of a
+    segment's parts equals that segment's bytes. ``independent`` is True only
+    for the first part of a segment (it begins on the keyframe + PAT/PMT, so a
+    client may start decoding there)."""
+
+    __slots__ = ("data", "duration", "independent")
+
+    def __init__(self, data, duration, independent=False):
+        self.data = data
+        self.duration = float(duration)
+        self.independent = independent
+
+
 def packet_pid(packet):
     """13-bit PID of a TS packet."""
     return ((packet[1] & 0x1F) << 8) | packet[2]
@@ -193,8 +209,12 @@ class TSSegmenter:
     it returns finished Segment objects as keyframe boundaries are crossed.
     """
 
-    def __init__(self, target_duration=4.0):
+    def __init__(self, target_duration=4.0, part_target=0.0):
         self.target_duration = float(target_duration)
+        # Low-Latency HLS: when > 0, emit Part objects every ~part_target
+        # seconds of the in-progress segment. 0 disables LL-HLS (segments only),
+        # which keeps the parser backward compatible for the non-LL path/tests.
+        self.part_target = float(part_target)
         self._pending = bytearray()
         self._current = bytearray()
         self._pat_packet = None
@@ -206,6 +226,10 @@ class TSSegmenter:
         self._collecting = False
         self._pending_discontinuity = False
         self._current_discontinuity = False
+        # Part accounting for the in-progress segment.
+        self._part_offset = 0        # byte index into _current where the open part began
+        self._part_start_pts = None  # PTS at the open part's first frame
+        self._part_index = 0         # 0-based part number within the current segment
 
     @property
     def video_detected(self):
@@ -227,8 +251,14 @@ class TSSegmenter:
         self._segment_start_pts = None
 
     def feed(self, data):
-        """Consume raw TS bytes; return a list of finished Segments (possibly empty)."""
-        segments = []
+        """Consume raw TS bytes; return a list of events (possibly empty).
+
+        With ``part_target == 0`` every event is a finished ``Segment`` (the
+        classic non-LL contract). With ``part_target > 0`` the list interleaves
+        ``Part`` events (emitted as the in-progress segment fills) with the
+        ``Segment`` that closes them; a segment's ``Part`` events always precede
+        its ``Segment`` in the stream. Dispatch by type at the call site."""
+        events = []
         self._pending.extend(data)
 
         while len(self._pending) >= TS_PACKET_SIZE:
@@ -250,20 +280,19 @@ class TSSegmenter:
 
             packet = bytes(self._pending[:TS_PACKET_SIZE])
             del self._pending[:TS_PACKET_SIZE]
-            finished = self._handle_packet(packet)
-            if finished is not None:
-                segments.append(finished)
+            events.extend(self._handle_packet(packet))
 
-        return segments
+        return events
 
     def _handle_packet(self, packet):
+        events = []
         pid = packet_pid(packet)
 
         if pid == 0:
             self._pat_packet = packet
             if self._pmt_pid is None:
                 self._pmt_pid = parse_pat(packet)
-            return None
+            return events
         if self._pmt_pid is not None and pid == self._pmt_pid:
             self._pmt_packet = packet
             video_pid, stream_type = parse_pmt(packet)
@@ -272,12 +301,11 @@ class TSSegmenter:
                 # provider failovers are tolerated.
                 self._video_pid = video_pid
                 self._video_stream_type = stream_type
-            return None
+            return events
 
         if self._video_pid is None:
-            return None
+            return events
 
-        finished = None
         if pid == self._video_pid and packet_pusi(packet):
             pts = extract_pts(packet)
             keyframe = starts_keyframe(packet, self._video_stream_type)
@@ -286,21 +314,74 @@ class TSSegmenter:
                 if keyframe:
                     self._begin_segment(pts)
             elif keyframe and pts is not None:
+                cut = False
+                duration = self.target_duration
                 if self._segment_start_pts is None:
                     # Discontinuity reset the timeline: cut here.
-                    finished = self._finish_segment(self.target_duration)
-                    self._begin_segment(pts)
+                    cut = True
                 else:
                     elapsed = pts - self._segment_start_pts
                     if elapsed < 0:
                         elapsed += PTS_WRAP / PTS_CLOCK
                     if elapsed >= self.target_duration:
-                        finished = self._finish_segment(elapsed)
-                        self._begin_segment(pts)
+                        duration = elapsed
+                        cut = True
+                if cut:
+                    # Flush the segment's trailing bytes as its final part, then
+                    # the segment itself, then open the next segment (its part 0
+                    # begins on this keyframe).
+                    self._emit_final_part(events, pts)
+                    events.append(self._finish_segment(duration))
+                    self._begin_segment(pts)
+                else:
+                    # Keyframe before the target: still a PES boundary a part
+                    # may close on.
+                    self._maybe_emit_part(events, pts)
+            else:
+                # Collecting, ordinary PES boundary: close the open part if due.
+                self._maybe_emit_part(events, pts)
 
         if self._collecting:
             self._current.extend(packet)
-        return finished
+        return events
+
+    def _maybe_emit_part(self, events, pts):
+        """Close the open part if it has reached part_target at this PES
+        boundary. The part is the bytes accumulated since the previous boundary
+        and does NOT include the triggering packet (which opens the next part)."""
+        if self.part_target <= 0 or pts is None or self._part_start_pts is None:
+            return
+        elapsed = pts - self._part_start_pts
+        if elapsed < 0:
+            elapsed += PTS_WRAP / PTS_CLOCK
+        if elapsed < self.part_target:
+            return
+        data = bytes(self._current[self._part_offset:])
+        if not data:
+            return
+        events.append(Part(data, elapsed, independent=(self._part_index == 0)))
+        self._part_offset = len(self._current)
+        self._part_start_pts = pts
+        self._part_index += 1
+
+    def _emit_final_part(self, events, end_pts):
+        """Flush the in-progress segment's trailing bytes as its last part when
+        the segment is cut, so a segment's parts tile the whole segment."""
+        if self.part_target <= 0:
+            return
+        data = bytes(self._current[self._part_offset:])
+        if not data:
+            return
+        duration = self.part_target
+        if end_pts is not None and self._part_start_pts is not None:
+            d = end_pts - self._part_start_pts
+            if d < 0:
+                d += PTS_WRAP / PTS_CLOCK
+            # Guard against a discontinuity/timeline jump producing a nonsense
+            # value; a legitimate final part is at most ~part_target long.
+            if 0 < d <= 2 * self.part_target:
+                duration = d
+        events.append(Part(data, duration, independent=(self._part_index == 0)))
 
     def _begin_segment(self, pts):
         self._current = bytearray()
@@ -312,6 +393,11 @@ class TSSegmenter:
         self._collecting = True
         self._current_discontinuity = self._pending_discontinuity
         self._pending_discontinuity = False
+        # Part 0 begins here, at offset 0 so it carries the PAT+PMT and the
+        # keyframe (making it the segment's INDEPENDENT part).
+        self._part_offset = 0
+        self._part_start_pts = pts
+        self._part_index = 0
 
     def _finish_segment(self, duration):
         if duration <= 0 or duration > 4 * self.target_duration:
@@ -326,45 +412,115 @@ class TSSegmenter:
         return segment
 
 
-def render_media_playlist(window, target_duration, segment_name="{seq}.ts"):
+def _append_part_line(lines, part_name, seq, index, part):
+    """Append one #EXT-X-PART line. part is [duration, independent]."""
+    duration = part[0]
+    independent = len(part) > 1 and part[1]
+    uri = part_name.format(seq=seq, part=index)
+    line = f'#EXT-X-PART:DURATION={duration:.5f},URI="{uri}"'
+    if independent:
+        line += ",INDEPENDENT=YES"
+    lines.append(line)
+
+
+def render_media_playlist(window, target_duration, segment_name="{seq}.ts",
+                          part_target=0.0, parts_by_seq=None, building=None,
+                          part_name="p{seq}.{part}.ts"):
     """
-    Render an HLS media playlist (RFC 8216, version 3) from a window of
-    segment descriptors: [{"seq": int, "dur": float, "disc": bool}, ...].
-    Segment URIs are relative so they resolve against the playlist URL.
+    Render an HLS media playlist from a window of segment descriptors:
+    [{"seq": int, "dur": float, "disc": bool}, ...]. Segment URIs are relative
+    so they resolve against the playlist URL.
+
+    Default output is RFC 8216 version 3. When ``part_target > 0`` the output
+    is a Low-Latency HLS playlist (version 10) that additionally carries
+    #EXT-X-SERVER-CONTROL (CAN-BLOCK-RELOAD), #EXT-X-PART-INF, #EXT-X-PART lines
+    for the most recent segments and the in-progress segment, and an
+    #EXT-X-PRELOAD-HINT for the next part. ``parts_by_seq`` maps a completed
+    segment's seq (str) to its list of [duration, independent] parts;
+    ``building`` is {"seq": int, "parts": [[duration, independent], ...]} for
+    the segment currently being produced.
     """
-    if not window:
+    ll = bool(part_target and part_target > 0)
+    parts_by_seq = parts_by_seq or {}
+    building = building or {}
+    building_parts = building.get("parts") or []
+    building_seq = building.get("seq")
+
+    # Nothing published yet: minimal valid live playlist, client retries.
+    if not window and not building_parts:
         return (
             "#EXTM3U\n"
             "#EXT-X-VERSION:3\n"
             "#EXT-X-INDEPENDENT-SEGMENTS\n"
-            # Ceil to match the populated branch; a fractional target must never
-            # round DOWN below a real EXTINF (RFC 8216 4.3.3.1).
+            # Ceil so a fractional target never rounds DOWN below a real EXTINF
+            # (RFC 8216 4.3.3.1).
             f"#EXT-X-TARGETDURATION:{int(max(target_duration, 1) + 0.999)}\n"
             "#EXT-X-MEDIA-SEQUENCE:0\n"
         )
-    max_duration = max(entry["dur"] for entry in window)
-    total_duration = sum(entry["dur"] for entry in window)
+
+    if window:
+        max_duration = max(entry["dur"] for entry in window)
+        total_duration = sum(entry["dur"] for entry in window)
+        media_sequence = window[0]["seq"]
+    else:
+        # Only in-progress parts exist (the first segment has not closed yet):
+        # let an LL client start from a partial segment for a fast first frame.
+        max_duration = target_duration
+        total_duration = sum(p[0] for p in building_parts)
+        media_sequence = building_seq if building_seq is not None else 0
+
     # TARGETDURATION must be >= every EXTINF rounded up (RFC 8216 4.3.3.1).
     advertised_target = int(max_duration + 0.999)
-    # Pin the live-edge start ~3 target durations back (the RFC 8216 4.3.5.2 /
-    # Apple convention that avoids edge starvation on a sliding live window),
-    # clamped to the window so a thin cold-start window never points before the
-    # first segment. Emitting it server-side makes the join point deterministic
-    # and identical across AVPlayer / Safari / hls.js instead of each client
-    # applying its own heuristic; a client that sets its own start offset still
-    # overrides this, and unknown-tag-tolerant players ignore it.
-    start_offset = min(3 * advertised_target, total_duration)
+
+    version = 10 if ll else 3
     lines = [
         "#EXTM3U",
-        "#EXT-X-VERSION:3",
+        f"#EXT-X-VERSION:{version}",
         "#EXT-X-INDEPENDENT-SEGMENTS",
         f"#EXT-X-TARGETDURATION:{advertised_target}",
-        f"#EXT-X-MEDIA-SEQUENCE:{window[0]['seq']}",
-        f"#EXT-X-START:TIME-OFFSET:-{start_offset:.3f},PRECISE=YES",
+        f"#EXT-X-MEDIA-SEQUENCE:{media_sequence}",
     ]
+
+    if ll:
+        # Advertise a PART-TARGET slightly above the emit threshold: a part is
+        # closed on the first frame boundary at or past the threshold, so its
+        # real duration can exceed the threshold by up to one frame. PART-TARGET
+        # must be >= every EXT-X-PART DURATION (RFC 8216bis), and PART-HOLD-BACK
+        # must be >= 3 x PART-TARGET.
+        adv_part = round(part_target + 0.05, 3)
+        hold_back = round(3 * adv_part, 3)
+        lines.append(f"#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={hold_back:.3f}")
+        lines.append(f"#EXT-X-PART-INF:PART-TARGET={adv_part:.3f}")
+        # Start near the live edge (a couple of hold-backs) so the low-latency
+        # win is realised instead of joining 3 target-durations back.
+        start_offset = min(2 * hold_back, total_duration)
+    else:
+        # Non-LL: join ~3 target durations back, the safe no-stall convention.
+        start_offset = min(3 * advertised_target, total_duration)
+
+    if total_duration:
+        lines.append(f"#EXT-X-START:TIME-OFFSET:-{start_offset:.3f},PRECISE=YES")
+
+    # Carry EXT-X-PART lines only for the last two completed segments so parts
+    # stay available within PART-HOLD-BACK without bloating the playlist with
+    # parts for the entire window.
+    part_seqs = {entry["seq"] for entry in window[-2:]} if (ll and window) else set()
+
     for entry in window:
         if entry.get("disc"):
             lines.append("#EXT-X-DISCONTINUITY")
+        if entry["seq"] in part_seqs:
+            for i, part in enumerate(parts_by_seq.get(str(entry["seq"]), [])):
+                _append_part_line(lines, part_name, entry["seq"], i, part)
         lines.append(f"#EXTINF:{entry['dur']:.3f},")
         lines.append(segment_name.format(seq=entry["seq"]))
+
+    # In-progress segment: its parts (no EXTINF yet) followed by a preload hint
+    # for the next part, which the client fetches with a blocking GET.
+    if ll and building_parts and building_seq is not None:
+        for i, part in enumerate(building_parts):
+            _append_part_line(lines, part_name, building_seq, i, part)
+        next_uri = part_name.format(seq=building_seq, part=len(building_parts))
+        lines.append(f'#EXT-X-PRELOAD-HINT:TYPE=PART,URI="{next_uri}"')
+
     return "\n".join(lines) + "\n"
