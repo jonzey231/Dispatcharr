@@ -34,7 +34,13 @@ HLS_KEY_TTL = 3600
 
 # Defaults; both overridable via proxy settings
 DEFAULT_SEGMENT_DURATION = 4
-DEFAULT_WINDOW_SIZE = 6
+# Retain 10 segments (~40s) in the rolling live window. A player starts
+# near the live edge regardless of window length, so a longer window adds
+# no latency; it only keeps older segments available so a client that
+# briefly falls behind (a stall, a slow network hiccup) can still fetch the
+# segment it is on instead of getting a 404 once it has rolled off. 6 (~24s)
+# proved too tight for AVPlayer after a stall (CoreMedia -12938 / HTTP 404).
+DEFAULT_WINDOW_SIZE = 10
 
 
 class HLSOutputManager:

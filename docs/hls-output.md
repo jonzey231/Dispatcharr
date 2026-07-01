@@ -53,7 +53,7 @@ The media playlist is a standard live RFC 8216 (version 3) playlist:
 - `#EXT-X-MEDIA-SEQUENCE:<n>` (monotonically increasing as segments roll off)
 - `#EXT-X-DISCONTINUITY` before a segment that follows a stream discontinuity
 - No `#EXT-X-ENDLIST` (the stream is live; players keep reloading)
-- A rolling window of segments (default 6 x ~4s)
+- A rolling window of segments (default 10 x ~4s)
 
 Segments are MPEG-TS, each prefixed with the current PAT and PMT so it decodes
 independently. No transcoding or remuxing is performed; the source packets are
@@ -88,5 +88,7 @@ HLS output carries the source codec untouched in MPEG-TS segments.
 ## Server settings
 
 - `HLS_SEGMENT_DURATION` (default 4 seconds) - target segment length.
-- `HLS_WINDOW_SIZE` (default 6) - number of segments retained in the rolling
-  live playlist.
+- `HLS_WINDOW_SIZE` (default 10) - number of segments retained in the rolling
+  live playlist. A longer window adds no latency (players start near the live
+  edge) and gives a client that briefly falls behind more room to catch up
+  before a segment rolls off.
