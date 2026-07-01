@@ -49,11 +49,19 @@ ghost-client heartbeat.
 The media playlist is a standard live RFC 8216 (version 3) playlist:
 
 - `#EXT-X-VERSION:3`
+- `#EXT-X-INDEPENDENT-SEGMENTS` (every segment starts on an IDR keyframe and is
+  self-contained, so a player can begin decoding or seek to any segment boundary
+  without fetching a prior segment)
 - `#EXT-X-TARGETDURATION:<n>` (integer, a true upper bound on every segment)
 - `#EXT-X-MEDIA-SEQUENCE:<n>` (monotonically increasing as segments roll off)
+- `#EXT-X-START:TIME-OFFSET:-<n>,PRECISE=YES` (server-pinned live-edge start,
+  ~3 target durations back, clamped to the window; makes the join point the same
+  across players. A player that sets its own start offset still overrides it, and
+  players that do not understand the tag ignore it)
 - `#EXT-X-DISCONTINUITY` before a segment that follows a stream discontinuity
 - No `#EXT-X-ENDLIST` (the stream is live; players keep reloading)
-- A rolling window of segments (default 10 x ~4s)
+- A rolling window of segments (default 10 x ~4s; real length is floored by the
+  source GOP, so ~2s-GOP content yields ~4.5-5.5s segments)
 
 Segments are MPEG-TS, each prefixed with the current PAT and PMT so it decodes
 independently. No transcoding or remuxing is performed; the source packets are
@@ -61,9 +69,13 @@ split on keyframe boundaries.
 
 ## MIME types and CORS
 
-- Playlist responses use `Content-Type: application/vnd.apple.mpegurl`.
-- Segment responses use `Content-Type: video/mp2t`.
-- Both send `Cache-Control: no-cache`.
+- Playlist responses use `Content-Type: application/vnd.apple.mpegurl` and
+  `Cache-Control: no-cache` (the playlist changes on every reload).
+- Segment responses use `Content-Type: video/mp2t`. A finished segment is
+  immutable (a `<seq>.ts` always maps to the same bytes, and sequence numbers are
+  never reused), so it is served `Cache-Control: public, max-age=60, immutable`
+  to let browsers/hls.js and any CDN reuse in-window re-requests. Expired
+  segments (404) are not cached.
 - All HLS responses (playlist, segments, redirect, errors) carry permissive
   CORS headers and answer `OPTIONS` preflight, so a browser hls.js / Safari
   MSE player can fetch them cross-origin. Native players ignore CORS.

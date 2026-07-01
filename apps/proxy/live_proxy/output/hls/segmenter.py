@@ -336,15 +336,31 @@ def render_media_playlist(window, target_duration, segment_name="{seq}.ts"):
         return (
             "#EXTM3U\n"
             "#EXT-X-VERSION:3\n"
-            f"#EXT-X-TARGETDURATION:{int(round(max(target_duration, 1)))}\n"
+            "#EXT-X-INDEPENDENT-SEGMENTS\n"
+            # Ceil to match the populated branch; a fractional target must never
+            # round DOWN below a real EXTINF (RFC 8216 4.3.3.1).
+            f"#EXT-X-TARGETDURATION:{int(max(target_duration, 1) + 0.999)}\n"
             "#EXT-X-MEDIA-SEQUENCE:0\n"
         )
     max_duration = max(entry["dur"] for entry in window)
+    total_duration = sum(entry["dur"] for entry in window)
+    # TARGETDURATION must be >= every EXTINF rounded up (RFC 8216 4.3.3.1).
+    advertised_target = int(max_duration + 0.999)
+    # Pin the live-edge start ~3 target durations back (the RFC 8216 4.3.5.2 /
+    # Apple convention that avoids edge starvation on a sliding live window),
+    # clamped to the window so a thin cold-start window never points before the
+    # first segment. Emitting it server-side makes the join point deterministic
+    # and identical across AVPlayer / Safari / hls.js instead of each client
+    # applying its own heuristic; a client that sets its own start offset still
+    # overrides this, and unknown-tag-tolerant players ignore it.
+    start_offset = min(3 * advertised_target, total_duration)
     lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
-        f"#EXT-X-TARGETDURATION:{int(max_duration + 0.999)}",
+        "#EXT-X-INDEPENDENT-SEGMENTS",
+        f"#EXT-X-TARGETDURATION:{advertised_target}",
         f"#EXT-X-MEDIA-SEQUENCE:{window[0]['seq']}",
+        f"#EXT-X-START:TIME-OFFSET:-{start_offset:.3f},PRECISE=YES",
     ]
     for entry in window:
         if entry.get("disc"):

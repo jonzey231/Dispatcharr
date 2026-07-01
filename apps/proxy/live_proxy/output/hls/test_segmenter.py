@@ -200,6 +200,10 @@ class PlaylistTests(unittest.TestCase):
         self.assertIn("#EXTINF:4.200,", text)
         self.assertIn("8.ts", text)
         self.assertNotIn("#EXT-X-ENDLIST", text)             # live
+        self.assertIn("#EXT-X-INDEPENDENT-SEGMENTS", text)   # segments are IDR-aligned
+        # Live-edge start pinned ~3 target-durations back, clamped to the window
+        # (min(3*5, 4.0+4.2+3.9) = min(15, 12.1) = 12.1)
+        self.assertIn("#EXT-X-START:TIME-OFFSET:-12.100,PRECISE=YES", text)
         # Discontinuity tag must precede its segment
         lines = text.splitlines()
         self.assertEqual(lines[lines.index("#EXT-X-DISCONTINUITY") + 2], "9.ts")
@@ -207,6 +211,9 @@ class PlaylistTests(unittest.TestCase):
     def test_render_empty_window(self):
         text = render_media_playlist([], 4)
         self.assertIn("#EXT-X-MEDIA-SEQUENCE:0", text)
+        self.assertIn("#EXT-X-INDEPENDENT-SEGMENTS", text)
+        self.assertIn("#EXT-X-TARGETDURATION:4", text)       # ceil(4)
+        self.assertNotIn("#EXT-X-START", text)               # no segments to offset from
 
 
 class VideoCodecTests(unittest.TestCase):
