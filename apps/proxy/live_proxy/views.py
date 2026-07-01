@@ -1263,5 +1263,13 @@ def hls_segment(request, channel_id, client_id, seq):
         return JsonResponse({"error": "Segment expired"}, status=404)
 
     response = HttpResponse(data, content_type="video/mp2t")
-    response["Cache-Control"] = "no-cache"
+    # A finished segment is immutable: put_fragment completes before the seq is
+    # ever advertised, and media-sequence numbers are monotonic (never reused),
+    # so a given /<seq>.ts always maps to the same bytes. Mark it cacheable +
+    # immutable so browsers/hls.js and any CDN in front of Dispatcharr serve
+    # concurrent in-window re-requests from cache instead of revalidating. The
+    # 60s max-age comfortably spans the default ~50s live window then expires;
+    # a larger configured window only loses cache hits at its tail, never
+    # correctness. The playlist itself stays no-cache (it changes every reload).
+    response["Cache-Control"] = "public, max-age=60, immutable"
     return response
