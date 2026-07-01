@@ -205,7 +205,7 @@ class PlaylistTests(unittest.TestCase):
         self.assertIn("#EXT-X-INDEPENDENT-SEGMENTS", text)   # segments are IDR-aligned
         # Live-edge start pinned ~3 target-durations back, clamped to the window
         # (min(3*5, 4.0+4.2+3.9) = min(15, 12.1) = 12.1)
-        self.assertIn("#EXT-X-START:TIME-OFFSET:-12.100,PRECISE=YES", text)
+        self.assertIn("#EXT-X-START:TIME-OFFSET=-12.100,PRECISE=YES", text)
         # Discontinuity tag must precede its segment
         lines = text.splitlines()
         self.assertEqual(lines[lines.index("#EXT-X-DISCONTINUITY") + 2], "9.ts")

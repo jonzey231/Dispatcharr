@@ -513,7 +513,7 @@ def render_media_playlist(window, target_duration, segment_name="{seq}.ts",
         start_offset = min(3 * advertised_target, total_duration)
 
     if total_duration:
-        lines.append(f"#EXT-X-START:TIME-OFFSET:-{start_offset:.3f},PRECISE=YES")
+        lines.append(f"#EXT-X-START:TIME-OFFSET=-{start_offset:.3f},PRECISE=YES")
 
     for entry in window:
         if entry.get("disc"):
