@@ -211,6 +211,14 @@ class TSSegmenter:
     def video_detected(self):
         return self._video_pid is not None
 
+    @property
+    def video_codec(self):
+        """Detected video codec family name (e.g. "h264", "h265"), or None
+        until the PMT has been parsed. Used to advertise the codec to
+        clients and to gate formats that a given HLS client cannot decode
+        (notably HEVC-in-MPEG-TS, which AVFoundation refuses)."""
+        return VIDEO_STREAM_TYPES.get(self._video_stream_type)
+
     def flag_discontinuity(self):
         """Mark that the NEXT emitted segment follows a stream discontinuity
         (provider failover, buffer skip-ahead)."""

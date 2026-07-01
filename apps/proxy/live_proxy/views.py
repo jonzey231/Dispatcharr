@@ -3,6 +3,7 @@ import time
 import random
 import re
 import pathlib
+from functools import wraps
 from django.db import close_old_connections
 from django.http import StreamingHttpResponse, JsonResponse, HttpResponseRedirect, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
@@ -1146,7 +1147,33 @@ def _hls_session_gone(channel_id, client_id):
     return False
 
 
-@api_view(["GET"])
+def _hls_cors(view):
+    """Attach permissive CORS headers to an HLS response and answer CORS
+    preflight, so browser HLS clients (hls.js / Safari MSE) can fetch the
+    playlist and every segment cross-origin. Native players (AVPlayer, VLC,
+    mpv, ffmpeg) do not enforce CORS, so this only unblocks the web use
+    case the output already advertises; it never restricts native access.
+    Applied to every response including errors/redirects, since a missing
+    Access-Control-Allow-Origin on a segment is a classic silent failure."""
+    @wraps(view)
+    def wrapper(request, *args, **kwargs):
+        if request.method == "OPTIONS":
+            response = HttpResponse(status=204)
+        else:
+            response = view(request, *args, **kwargs)
+        origin = request.META.get("HTTP_ORIGIN")
+        response["Access-Control-Allow-Origin"] = origin or "*"
+        if origin:
+            response["Vary"] = "Origin"
+        response["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+        response["Access-Control-Allow-Headers"] = "*"
+        response["Access-Control-Max-Age"] = "86400"
+        return response
+    return wrapper
+
+
+@_hls_cors
+@api_view(["GET", "OPTIONS"])
 @permission_classes([AllowAny])
 def hls_playlist(request, channel_id, client_id):
     """Rolling live media playlist for one HLS client."""
@@ -1184,6 +1211,20 @@ def hls_playlist(request, channel_id, client_id):
     from .output.hls.segmenter import render_media_playlist
     try:
         state = json.loads(playlist_json)
+        # HLS output carries TS segments with the source codec untouched.
+        # Only H.264 in MPEG-TS is broadly playable over HLS: AVFoundation
+        # (AVPlayer, Safari) refuses HEVC/H.265-in-TS outright, so serving
+        # it would black-screen those clients with no error. Refuse the HLS
+        # format for non-H.264 video with a clear status instead, so a
+        # client gets a clean signal and can fall back (mpv) or use the
+        # MPEG-TS/fMP4 output. HEVC-in-HLS needs fMP4/CMAF (future work).
+        vcodec = state.get("vcodec")
+        if vcodec and vcodec != "h264":
+            return JsonResponse(
+                {"error": f"HLS output supports H.264 video only; this channel is {vcodec}. "
+                          f"Use the MPEG-TS or fMP4 output format for this channel."},
+                status=415,
+            )
         body = render_media_playlist(state.get("window", []), state.get("target", 4))
     except (ValueError, KeyError) as e:
         logger.error(f"[{client_id}] Malformed HLS playlist state for {channel_id}: {e}")
@@ -1194,7 +1235,8 @@ def hls_playlist(request, channel_id, client_id):
     return response
 
 
-@api_view(["GET"])
+@_hls_cors
+@api_view(["GET", "OPTIONS"])
 @permission_classes([AllowAny])
 def hls_segment(request, channel_id, client_id, seq):
     """One HLS media segment, fetched by media sequence number from Redis."""

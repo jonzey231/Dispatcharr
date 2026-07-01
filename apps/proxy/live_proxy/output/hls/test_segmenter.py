@@ -209,5 +209,18 @@ class PlaylistTests(unittest.TestCase):
         self.assertIn("#EXT-X-MEDIA-SEQUENCE:0", text)
 
 
+class VideoCodecTests(unittest.TestCase):
+    def test_codec_none_before_pmt(self):
+        seg = TSSegmenter()
+        self.assertIsNone(seg.video_codec)
+        self.assertFalse(seg.video_detected)
+
+    def test_codec_h264_learned_from_pmt(self):
+        seg = TSSegmenter()
+        seg.feed(make_pat() + make_pmt())
+        self.assertTrue(seg.video_detected)
+        self.assertEqual(seg.video_codec, "h264")
+
+
 if __name__ == "__main__":
     unittest.main()
