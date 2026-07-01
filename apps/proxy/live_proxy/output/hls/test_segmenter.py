@@ -281,6 +281,26 @@ class PartTests(unittest.TestCase):
         self.assertTrue(all(isinstance(e, Segment) for e in events))
         self.assertEqual(len(events), 1)
 
+    def test_bframe_reorder_gives_no_garbage_durations(self):
+        # Decode-order PTS that dips below the previous frame like B-frame
+        # reordering. A naive pts-start delta goes slightly negative and, if
+        # treated as a 33-bit wrap, yields a ~95443s garbage part duration that
+        # makes AVPlayer reject the playlist. Durations must stay sane.
+        seg = TSSegmenter(target_duration=4.0, part_target=0.5)
+        frames = [(0.0, True)]
+        base = 0.0
+        while base < 4.0:
+            base += 0.25
+            frames.append((round(base + 0.1, 3), False))  # ahead in presentation
+            frames.append((round(base, 3), False))         # dips back (B-frame)
+        frames.append((4.2, True))  # keyframe cuts the segment
+        events = self._feed(seg, frames)
+        parts = [e for e in events if isinstance(e, Part)]
+        self.assertTrue(parts)
+        for p in parts:
+            self.assertGreater(p.duration, 0)
+            self.assertLess(p.duration, seg.target_duration)  # never ~95443s
+
 
 class VideoCodecTests(unittest.TestCase):
     def test_codec_none_before_pmt(self):

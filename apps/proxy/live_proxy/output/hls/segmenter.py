@@ -320,9 +320,7 @@ class TSSegmenter:
                     # Discontinuity reset the timeline: cut here.
                     cut = True
                 else:
-                    elapsed = pts - self._segment_start_pts
-                    if elapsed < 0:
-                        elapsed += PTS_WRAP / PTS_CLOCK
+                    elapsed = self._pts_delta(pts, self._segment_start_pts)
                     if elapsed >= self.target_duration:
                         duration = elapsed
                         cut = True
@@ -345,15 +343,28 @@ class TSSegmenter:
             self._current.extend(packet)
         return events
 
+    @staticmethod
+    def _pts_delta(pts, start):
+        """Presentation-time delta in seconds, tolerating a real 33-bit PTS wrap
+        (a huge negative jump) but NOT the small negative deltas that B-frame
+        reordering produces (presentation order != decode order). A small
+        negative is returned as-is (negative) so callers read it as 'not enough
+        time yet' rather than adding ~95443s of wrap and emitting a garbage
+        duration."""
+        d = pts - start
+        if d < -(PTS_WRAP / PTS_CLOCK) / 2:
+            d += PTS_WRAP / PTS_CLOCK
+        return d
+
     def _maybe_emit_part(self, events, pts):
         """Close the open part if it has reached part_target at this PES
         boundary. The part is the bytes accumulated since the previous boundary
-        and does NOT include the triggering packet (which opens the next part)."""
+        and does NOT include the triggering packet (which opens the next part).
+        A frame whose PTS is below the part start (B-frame reordering) yields a
+        negative delta and is simply skipped until a later frame advances time."""
         if self.part_target <= 0 or pts is None or self._part_start_pts is None:
             return
-        elapsed = pts - self._part_start_pts
-        if elapsed < 0:
-            elapsed += PTS_WRAP / PTS_CLOCK
+        elapsed = self._pts_delta(pts, self._part_start_pts)
         if elapsed < self.part_target:
             return
         data = bytes(self._current[self._part_offset:])
@@ -374,11 +385,10 @@ class TSSegmenter:
             return
         duration = self.part_target
         if end_pts is not None and self._part_start_pts is not None:
-            d = end_pts - self._part_start_pts
-            if d < 0:
-                d += PTS_WRAP / PTS_CLOCK
-            # Guard against a discontinuity/timeline jump producing a nonsense
-            # value; a legitimate final part is at most ~part_target long.
+            d = self._pts_delta(end_pts, self._part_start_pts)
+            # Guard against a discontinuity/timeline jump or B-frame reorder
+            # producing a nonsense value; a legitimate final part is at most
+            # ~part_target long.
             if 0 < d <= 2 * self.part_target:
                 duration = d
         events.append(Part(data, duration, independent=(self._part_index == 0)))
@@ -446,8 +456,11 @@ def render_media_playlist(window, target_duration, segment_name="{seq}.ts",
     building_parts = building.get("parts") or []
     building_seq = building.get("seq")
 
-    # Nothing published yet: minimal valid live playlist, client retries.
-    if not window and not building_parts:
+    # Until at least one whole segment anchors the window, serve a minimal
+    # playlist and let the client retry. A Media Playlist that carries only
+    # partial segments and no EXTINF is not something AVPlayer will start on, so
+    # LL delivery begins once a complete segment exists.
+    if not window:
         return (
             "#EXTM3U\n"
             "#EXT-X-VERSION:3\n"
@@ -458,16 +471,9 @@ def render_media_playlist(window, target_duration, segment_name="{seq}.ts",
             "#EXT-X-MEDIA-SEQUENCE:0\n"
         )
 
-    if window:
-        max_duration = max(entry["dur"] for entry in window)
-        total_duration = sum(entry["dur"] for entry in window)
-        media_sequence = window[0]["seq"]
-    else:
-        # Only in-progress parts exist (the first segment has not closed yet):
-        # let an LL client start from a partial segment for a fast first frame.
-        max_duration = target_duration
-        total_duration = sum(p[0] for p in building_parts)
-        media_sequence = building_seq if building_seq is not None else 0
+    max_duration = max(entry["dur"] for entry in window)
+    total_duration = sum(entry["dur"] for entry in window)
+    media_sequence = window[0]["seq"]
 
     # TARGETDURATION must be >= every EXTINF rounded up (RFC 8216 4.3.3.1).
     advertised_target = int(max_duration + 0.999)
@@ -481,13 +487,21 @@ def render_media_playlist(window, target_duration, segment_name="{seq}.ts",
         f"#EXT-X-MEDIA-SEQUENCE:{media_sequence}",
     ]
 
+    # EXT-X-PART lines are carried only for the last two completed segments so
+    # parts stay available within PART-HOLD-BACK without bloating the playlist.
+    part_seqs = {entry["seq"] for entry in window[-2:]} if ll else set()
+
     if ll:
-        # Advertise a PART-TARGET slightly above the emit threshold: a part is
-        # closed on the first frame boundary at or past the threshold, so its
-        # real duration can exceed the threshold by up to one frame. PART-TARGET
-        # must be >= every EXT-X-PART DURATION (RFC 8216bis), and PART-HOLD-BACK
-        # must be >= 3 x PART-TARGET.
-        adv_part = round(part_target + 0.05, 3)
+        # PART-TARGET must be >= every EXT-X-PART DURATION (RFC 8216bis). Derive
+        # it from the actual maximum part duration that will appear in THIS
+        # playlist (floored at the configured target, plus a small margin), so
+        # PTS jitter can never make a listed DURATION exceed the advertised
+        # PART-TARGET. PART-HOLD-BACK must be >= 3 x PART-TARGET.
+        listed = list(building_parts)
+        for seq in part_seqs:
+            listed += parts_by_seq.get(str(seq), [])
+        max_part = max([part_target] + [p[0] for p in listed])
+        adv_part = round(max_part + 0.02, 3)
         hold_back = round(3 * adv_part, 3)
         lines.append(f"#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={hold_back:.3f}")
         lines.append(f"#EXT-X-PART-INF:PART-TARGET={adv_part:.3f}")
@@ -500,11 +514,6 @@ def render_media_playlist(window, target_duration, segment_name="{seq}.ts",
 
     if total_duration:
         lines.append(f"#EXT-X-START:TIME-OFFSET:-{start_offset:.3f},PRECISE=YES")
-
-    # Carry EXT-X-PART lines only for the last two completed segments so parts
-    # stay available within PART-HOLD-BACK without bloating the playlist with
-    # parts for the entire window.
-    part_seqs = {entry["seq"] for entry in window[-2:]} if (ll and window) else set()
 
     for entry in window:
         if entry.get("disc"):
