@@ -346,14 +346,15 @@ def render_media_playlist(window, target_duration, segment_name="{seq}.ts"):
     total_duration = sum(entry["dur"] for entry in window)
     # TARGETDURATION must be >= every EXTINF rounded up (RFC 8216 4.3.3.1).
     advertised_target = int(max_duration + 0.999)
-    # Pin the live-edge start ~3 target durations back (the RFC 8216 4.3.5.2 /
-    # Apple convention that avoids edge starvation on a sliding live window),
-    # clamped to the window so a thin cold-start window never points before the
-    # first segment. Emitting it server-side makes the join point deterministic
-    # and identical across AVPlayer / Safari / hls.js instead of each client
-    # applying its own heuristic; a client that sets its own start offset still
-    # overrides this, and unknown-tag-tolerant players ignore it.
-    start_offset = min(3 * advertised_target, total_duration)
+    # Pin the live-edge start ~2 real segments back (RFC 8216 4.3.5.2), clamped
+    # to the window so a thin cold-start window never points before the first
+    # segment. Two segments (~10s at the ~5s default) is the practical sweet
+    # spot: far enough to not starve at the edge, close enough to keep live
+    # latency low. Emitting it server-side makes the join point deterministic and
+    # identical across AVPlayer / Safari / hls.js instead of each client applying
+    # its own heuristic; a client that sets its own start offset still overrides
+    # this, and unknown-tag-tolerant players ignore it.
+    start_offset = min(2 * max_duration, total_duration)
     lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
