@@ -360,7 +360,7 @@ def render_media_playlist(window, target_duration, segment_name="{seq}.ts"):
         "#EXT-X-INDEPENDENT-SEGMENTS",
         f"#EXT-X-TARGETDURATION:{advertised_target}",
         f"#EXT-X-MEDIA-SEQUENCE:{window[0]['seq']}",
-        f"#EXT-X-START:TIME-OFFSET:-{start_offset:.3f},PRECISE=YES",
+        f"#EXT-X-START:TIME-OFFSET=-{start_offset:.3f},PRECISE=YES",
     ]
     for entry in window:
         if entry.get("disc"):

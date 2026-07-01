@@ -54,7 +54,7 @@ The media playlist is a standard live RFC 8216 (version 3) playlist:
   without fetching a prior segment)
 - `#EXT-X-TARGETDURATION:<n>` (integer, a true upper bound on every segment)
 - `#EXT-X-MEDIA-SEQUENCE:<n>` (monotonically increasing as segments roll off)
-- `#EXT-X-START:TIME-OFFSET:-<n>,PRECISE=YES` (server-pinned live-edge start,
+- `#EXT-X-START:TIME-OFFSET=-<n>,PRECISE=YES` (server-pinned live-edge start,
   ~3 target durations back, clamped to the window; makes the join point the same
   across players. A player that sets its own start offset still overrides it, and
   players that do not understand the tag ignore it)
