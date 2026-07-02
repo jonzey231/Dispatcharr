@@ -201,9 +201,9 @@ class PlaylistTests(unittest.TestCase):
         self.assertIn("8.ts", text)
         self.assertNotIn("#EXT-X-ENDLIST", text)             # live
         self.assertIn("#EXT-X-INDEPENDENT-SEGMENTS", text)   # segments are IDR-aligned
-        # Live-edge start pinned ~2 real segments back, clamped to the window
-        # (min(2*4.2, 4.0+4.2+3.9) = min(8.4, 12.1) = 8.4)
-        self.assertIn("#EXT-X-START:TIME-OFFSET=-8.400,PRECISE=YES", text)
+        # Live-edge start frozen at 2.5x the config target (2.5*4=10), emitted
+        # because the window (12.1s) is deep enough to honor it.
+        self.assertIn("#EXT-X-START:TIME-OFFSET=-10.000,PRECISE=YES", text)
         # Discontinuity tag must precede its segment
         lines = text.splitlines()
         self.assertEqual(lines[lines.index("#EXT-X-DISCONTINUITY") + 2], "9.ts")
@@ -214,6 +214,28 @@ class PlaylistTests(unittest.TestCase):
         self.assertIn("#EXT-X-INDEPENDENT-SEGMENTS", text)
         self.assertIn("#EXT-X-TARGETDURATION:4", text)       # ceil(4)
         self.assertNotIn("#EXT-X-START", text)               # no segments to offset from
+
+    def test_targetduration_constant_across_window_shift(self):
+        # RFC 8216 6.2.1: TARGETDURATION MUST NOT change across reloads. With a
+        # frozen adv_target the emitted value is identical no matter how the
+        # window's max EXTINF flaps across integer ceilings (the ESPN 5/6/7 bug).
+        adv = 8
+        w1 = [{"seq": 1, "dur": 4.05, "disc": False}, {"seq": 2, "dur": 4.60, "disc": False}]
+        w2 = [{"seq": 2, "dur": 4.60, "disc": False}, {"seq": 3, "dur": 6.46, "disc": False}]
+        w3 = [{"seq": 3, "dur": 6.46, "disc": False}, {"seq": 4, "dur": 5.01, "disc": False}]
+        tds = set()
+        starts = set()
+        for w in (w1, w2, w3):
+            text = render_media_playlist(w, 4, adv_target=adv)
+            td = [ln for ln in text.splitlines() if ln.startswith("#EXT-X-TARGETDURATION")]
+            self.assertEqual(td, ["#EXT-X-TARGETDURATION:8"])
+            tds.update(td)
+            starts.update(ln for ln in text.splitlines() if ln.startswith("#EXT-X-START"))
+            # TD must be >= every rounded EXTINF (RFC 8216 4.3.3.1).
+            for e in w:
+                self.assertLessEqual(round(e["dur"]), adv)
+        self.assertEqual(len(tds), 1)      # never changed
+        self.assertEqual(len(starts), 1)   # EXT-X-START also byte-stable
 
 
 class VideoCodecTests(unittest.TestCase):
