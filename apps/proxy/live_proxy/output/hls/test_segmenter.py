@@ -203,12 +203,27 @@ class PlaylistTests(unittest.TestCase):
         self.assertIn("8.ts", text)
         self.assertNotIn("#EXT-X-ENDLIST", text)             # live
         self.assertIn("#EXT-X-INDEPENDENT-SEGMENTS", text)   # segments are IDR-aligned
-        # Live-edge start pinned ~3 target-durations back, clamped to the window
-        # (min(3*5, 4.0+4.2+3.9) = min(15, 12.1) = 12.1)
-        self.assertIn("#EXT-X-START:TIME-OFFSET=-12.100,PRECISE=YES", text)
+        # EXT-X-START is suppressed until the window is deep enough to honor a
+        # frozen 3*TARGETDURATION join point (3*5 = 15s > 12.1s here), so the
+        # advertised offset never changes across reloads (RFC 8216 6.2.1).
+        self.assertNotIn("#EXT-X-START", text)
         # Discontinuity tag must precede its segment
         lines = text.splitlines()
         self.assertEqual(lines[lines.index("#EXT-X-DISCONTINUITY") + 2], "9.ts")
+
+    def test_render_non_ll_start_frozen_once_deep(self):
+        # Once the window holds >= 3*adv_target of content, EXT-X-START appears
+        # and equals the frozen constant, unchanged as the window shifts.
+        adv_target = 8
+        w1 = [{"seq": i, "dur": 5.0, "disc": False} for i in range(6)]     # 30s
+        w2 = [{"seq": i, "dur": 5.0, "disc": False} for i in range(1, 7)]  # shifted
+        t1 = render_media_playlist(w1, 4, adv_target=adv_target)
+        t2 = render_media_playlist(w2, 4, adv_target=adv_target)
+        self.assertIn("#EXT-X-START:TIME-OFFSET=-24.000,PRECISE=YES", t1)
+        self.assertIn("#EXT-X-START:TIME-OFFSET=-24.000,PRECISE=YES", t2)
+        # And a shallow window (< 24s) suppresses it entirely.
+        shallow = [{"seq": 0, "dur": 5.0, "disc": False}]
+        self.assertNotIn("#EXT-X-START", render_media_playlist(shallow, 4, adv_target=adv_target))
 
     def test_render_empty_window(self):
         text = render_media_playlist([], 4)
@@ -224,12 +239,19 @@ class PlaylistTests(unittest.TestCase):
         ]
         parts_by_seq = {"6": [[0.5, True], [0.5, False]]}
         building = {"seq": 7, "parts": [[0.5, True], [0.4, False]]}
+        # part_target here is the FROZEN advertised PART-TARGET (adv_part), which
+        # the manager computes and carries in the descriptor; render emits it and
+        # PART-HOLD-BACK = 3x it verbatim, recomputing neither.
         text = render_media_playlist(
-            window, 4, part_target=0.5, parts_by_seq=parts_by_seq, building=building
+            window, 4, part_target=0.56, parts_by_seq=parts_by_seq, building=building,
+            adv_target=8,
         )
         self.assertIn("#EXT-X-VERSION:10", text)
-        self.assertIn("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=", text)
-        self.assertIn("#EXT-X-PART-INF:PART-TARGET=", text)
+        self.assertIn("#EXT-X-TARGETDURATION:8", text)  # frozen, not ceil(4.1)=5
+        self.assertIn("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.680", text)
+        self.assertIn("#EXT-X-PART-INF:PART-TARGET=0.560", text)
+        # LL never carries EXT-X-START: PART-HOLD-BACK positions the client.
+        self.assertNotIn("#EXT-X-START", text)
         # Parts of the last completed segment, with the first marked independent.
         self.assertIn('#EXT-X-PART:DURATION=0.50000,URI="p6.0.ts",INDEPENDENT=YES', text)
         self.assertIn('#EXT-X-PART:DURATION=0.50000,URI="p6.1.ts"', text)
@@ -240,6 +262,70 @@ class PlaylistTests(unittest.TestCase):
         self.assertIn("6.ts", text)
         # Same call without part_target stays a plain version-3 playlist.
         self.assertIn("#EXT-X-VERSION:3", render_media_playlist(window, 4))
+
+    def test_targetduration_constant_across_window_shift(self):
+        # RFC 8216 6.2.1: EXT-X-TARGETDURATION MUST NOT change across reloads.
+        # Roll a window whose EXTINF maxima cross integer ceilings (4.604 -> 6.457
+        # -> back down) and assert the advertised target is byte-identical and >=
+        # every rounded EXTINF in all renders (4.3.3.1).
+        adv_target = 8
+        windows = [
+            [{"seq": 1, "dur": 4.604}, {"seq": 2, "dur": 4.421}, {"seq": 3, "dur": 5.005}],
+            [{"seq": 2, "dur": 4.421}, {"seq": 3, "dur": 5.005}, {"seq": 4, "dur": 6.457}],
+            [{"seq": 3, "dur": 5.005}, {"seq": 4, "dur": 6.457}, {"seq": 5, "dur": 4.100}],
+        ]
+        lines = []
+        for w in windows:
+            text = render_media_playlist(w, 4, part_target=0.56, adv_target=adv_target)
+            td = [l for l in text.splitlines() if l.startswith("#EXT-X-TARGETDURATION:")]
+            self.assertEqual(td, ["#EXT-X-TARGETDURATION:8"])
+            for entry in w:
+                self.assertLessEqual(round(entry["dur"]), adv_target)
+            lines.append(td[0])
+        self.assertEqual(len(set(lines)), 1)  # identical across all shifts
+
+    def test_part_target_and_holdback_constant(self):
+        # PART-TARGET / PART-HOLD-BACK are frozen constants: render must emit the
+        # passed adv_part verbatim regardless of the listed part maxima (0.501 vs
+        # 0.534), so AVPlayer's blocking-reload timing model never sees them flap.
+        w1 = [{"seq": 6, "dur": 4.1}]
+        w2 = [{"seq": 6, "dur": 4.1}]
+        t1 = render_media_playlist(
+            w1, 4, part_target=0.56, parts_by_seq={"6": [[0.501, True]]},
+            building={"seq": 7, "parts": [[0.501, True]]}, adv_target=8)
+        t2 = render_media_playlist(
+            w2, 4, part_target=0.56, parts_by_seq={"6": [[0.534, True]]},
+            building={"seq": 7, "parts": [[0.534, True]]}, adv_target=8)
+        for text in (t1, t2):
+            self.assertIn("#EXT-X-PART-INF:PART-TARGET=0.560", text)
+            self.assertIn("PART-HOLD-BACK=1.680", text)
+
+    def test_ll_program_date_time_and_building_discontinuity(self):
+        # Apple's LL profile requires EXT-X-PROGRAM-DATE-TIME per segment; the
+        # building segment's discontinuity must be signalled before its first part
+        # (never inserted retroactively).
+        window = [
+            {"seq": 5, "dur": 4.0, "disc": False, "pdt": "2026-07-01T00:00:00.000+00:00"},
+            {"seq": 6, "dur": 4.1, "disc": True, "pdt": "2026-07-01T00:00:04.000+00:00"},
+        ]
+        building = {"seq": 7, "parts": [[0.5, True]], "disc": True}
+        text = render_media_playlist(
+            window, 4, part_target=0.56,
+            parts_by_seq={"6": [[0.5, True]]}, building=building, adv_target=8)
+        lines = text.splitlines()
+        # Segment 5 has no listed parts, so its PDT sits immediately before EXTINF.
+        pdt5 = lines.index("#EXT-X-PROGRAM-DATE-TIME:2026-07-01T00:00:00.000+00:00")
+        self.assertEqual(lines[pdt5 + 1], "#EXTINF:4.000,")
+        # Segment 6's PDT precedes its EXTINF (parts intervene) and follows the
+        # discontinuity tag for that segment.
+        pdt6 = lines.index("#EXT-X-PROGRAM-DATE-TIME:2026-07-01T00:00:04.000+00:00")
+        extinf6 = lines.index("#EXTINF:4.100,")
+        self.assertLess(pdt6, extinf6)
+        disc_positions = [i for i, l in enumerate(lines) if l == "#EXT-X-DISCONTINUITY"]
+        self.assertTrue(any(i < pdt6 for i in disc_positions))  # seg-6 disc before its PDT
+        # Building discontinuity precedes the building segment's first part line.
+        first_building_part = lines.index('#EXT-X-PART:DURATION=0.50000,URI="p7.0.ts",INDEPENDENT=YES')
+        self.assertTrue(any(i < first_building_part for i in disc_positions))
 
 
 class PartTests(unittest.TestCase):
@@ -300,6 +386,86 @@ class PartTests(unittest.TestCase):
         for p in parts:
             self.assertGreater(p.duration, 0)
             self.assertLess(p.duration, seg.target_duration)  # never ~95443s
+
+    def test_forced_cut_bounds_segment_to_frozen_target(self):
+        # Keyframe drought: no keyframe appears for well past the target. The
+        # segmenter must force a cut at max_segment_duration so no EXTINF can
+        # exceed the frozen advertised TARGETDURATION (RFC 8216 4.3.3.1).
+        seg = TSSegmenter(target_duration=4.0, max_segment_duration=8.0)
+        frames = [(0.0, True)]
+        t = 0.5
+        while t <= 9.0:              # only one keyframe (at 0); pure drought after
+            frames.append((round(t, 3), False))
+            t += 0.5
+        events = self._feed(seg, frames)
+        segments = [e for e in events if isinstance(e, Segment)]
+        self.assertTrue(segments)                       # a cut was forced
+        for s in segments:
+            self.assertLessEqual(s.duration, 8.0)       # never exceeds the ceiling
+            self.assertLessEqual(round(s.duration), 8)  # nor its rounded EXTINF
+
+    def test_disc_cut_reports_measured_span_not_target(self):
+        # A discontinuity cut must report the CLOSING segment's measured span,
+        # not the nominal target, and must not be poisoned by the post-jump
+        # keyframe's PTS (RFC 8216 4.3.2.1).
+        seg = TSSegmenter(target_duration=4.0)
+        seg.feed(make_pat())
+        seg.feed(make_pmt())
+        seg.feed(make_video_pes(0.0, keyframe=True))
+        seg.feed(make_video_pes(2.0, keyframe=False))   # last real frame at 2.0s
+        seg.flag_discontinuity()
+        events = seg.feed(make_video_pes(100.0, keyframe=True))  # timeline jump
+        segments = [e for e in events if isinstance(e, Segment)]
+        self.assertEqual(len(segments), 1)
+        self.assertAlmostEqual(segments[0].duration, 2.0, places=3)  # measured, not 4.0
+        self.assertFalse(segments[0].discontinuity)     # the jump tags the NEXT segment
+
+    def test_part_ceiling_clamps_over_target_tail(self):
+        # A coarse frame cadence makes a tail longer than the advertised ceiling;
+        # every emitted part duration must still be <= the ceiling so no
+        # EXT-X-PART exceeds the frozen PART-TARGET (RFC 8216bis 4.4.4.9).
+        ceiling = 0.56
+        seg = TSSegmenter(target_duration=4.0, part_target=0.5, part_ceiling=ceiling)
+        # ~1.5fps: PES boundaries 0.7s apart, so a raw tail would reach ~0.7s.
+        frames = [(0.0, True), (0.7, False), (1.4, False), (2.1, False),
+                  (2.8, False), (3.5, False), (4.2, True)]
+        events = self._feed(seg, frames)
+        parts = [e for e in events if isinstance(e, Part)]
+        self.assertTrue(parts)
+        for p in parts:
+            self.assertLessEqual(p.duration, ceiling + 1e-9)
+
+    def test_non_final_parts_land_in_85_percent_band(self):
+        # At a realistic frame cadence the frozen adv_part (part_target * 1.12)
+        # keeps every non-final part inside [0.85*adv_part, adv_part]
+        # (RFC 8216bis 4.4.4.9), the last part of each segment exempt.
+        part_target = 0.5
+        adv_part = round(part_target * 1.12, 3)          # 0.56, as the manager freezes
+        seg = TSSegmenter(target_duration=4.0, part_target=part_target)
+        frames = [(0.0, True)]
+        i = 1
+        while i / 30.0 < 8.0:                            # 30fps, two 4s segments
+            t = round(i / 30.0, 5)
+            kf = abs(t - 4.0) < 1e-6                     # a keyframe at the 4s target
+            frames.append((t, kf))
+            i += 1
+        events = self._feed(seg, frames)
+        # Split parts by the Segment they precede; the last part before each
+        # Segment is that segment's final (exempt) part.
+        groups, cur = [], []
+        for e in events:
+            if isinstance(e, Part):
+                cur.append(e)
+            elif isinstance(e, Segment):
+                groups.append(cur)
+                cur = []
+        self.assertTrue(any(len(g) >= 2 for g in groups))
+        for g in groups:
+            for p in g[:-1]:                             # non-final parts
+                self.assertLessEqual(p.duration, adv_part)
+                self.assertGreaterEqual(p.duration, 0.85 * adv_part)
+            if g:
+                self.assertLessEqual(g[-1].duration, adv_part)  # final part
 
 
 class VideoCodecTests(unittest.TestCase):

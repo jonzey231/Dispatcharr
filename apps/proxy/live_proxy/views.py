@@ -1173,14 +1173,27 @@ def _hls_cors(view):
 
 
 def _hls_part_available(state, msn, part):
-    """True if the playlist descriptor already contains partial segment
-    (msn, part), has advanced past it, or the requested segment has rolled off
-    the window (in which case the spec says to return the current playlist)."""
+    """True if the playlist descriptor already satisfies a blocking reload for
+    (msn, part), i.e. it contains that partial segment, has advanced past it, or
+    the requested segment has rolled off the window (in which case the spec says
+    to return the current playlist).
+
+    ``part`` is None for a Media-Sequence-only reload (_HLS_msn with no
+    _HLS_part): the request is satisfied only once segment ``msn`` is COMPLETE
+    (a later segment has begun building, or msn sits within the closed window),
+    NOT merely once its first part exists."""
     window = state.get("window") or []
     if window and msn < window[0]["seq"]:
         return True  # rolled off; unblock and return current
     building = state.get("building") or {}
     b_seq = building.get("seq")
+    if part is None:
+        # msn-only: satisfied when segment msn is fully published.
+        if b_seq is not None:
+            return msn < b_seq
+        if window:
+            return msn <= window[-1]["seq"]
+        return False
     if b_seq is not None:
         if msn < b_seq:
             return True  # that segment is already complete (all parts present)
@@ -1228,30 +1241,65 @@ def hls_playlist(request, channel_id, client_id):
         response["Retry-After"] = "2"
         return response
 
-    # Low-Latency HLS Blocking Playlist Reload: when the client asks for a
-    # media sequence / partial segment it has not seen yet (_HLS_msn/_HLS_part),
-    # hold the request (gevent-cooperative, so it does not tie up a worker) until
-    # that part is published, then return the freshest playlist. Bounded at 5s so
-    # a re-request is cheap and a dead stream cannot pin the greenlet.
+    # Low-Latency HLS Blocking Playlist Reload (rfc8216bis 6.2.5.2). When the
+    # client asks for a media sequence / partial segment it has not seen yet
+    # (_HLS_msn[/_HLS_part]), hold the request (gevent-cooperative, so it does
+    # not tie up a worker) until the playlist contains it, then return the
+    # freshest playlist. The server MUST defer until the requested MSN/Part is
+    # present or answer with an error: a stale 200 that lacks the requested part
+    # is neither, and wedges a desynced player in an error-free reload loop.
     want_msn = request.GET.get("_HLS_msn")
-    if want_msn is not None:
+    want_part = request.GET.get("_HLS_part")
+    if want_msn is None:
+        if want_part is not None:
+            # _HLS_part without _HLS_msn is a malformed directive (6.2.5.2 MUST).
+            return HttpResponse(status=400)
+    else:
         try:
             target_msn = int(want_msn)
-            target_part = int(request.GET.get("_HLS_part", 0))
-            deadline = time.time() + 5
-            while time.time() < deadline:
-                try:
-                    st = json.loads(playlist_json) if playlist_json else None
-                except ValueError:
-                    st = None
-                if st and _hls_part_available(st, target_msn, target_part):
-                    break
-                if _hls_session_gone(channel_id, client_id):
-                    return JsonResponse({"error": "Stream stopped"}, status=410)
-                gevent.sleep(0.05)
-                playlist_json = redis_client.get(playlist_key)
+            target_part = int(want_part) if want_part is not None else None
         except (TypeError, ValueError):
+            return HttpResponse(status=400)
+
+        try:
+            st = json.loads(playlist_json) if playlist_json else None
+        except ValueError:
+            st = None
+
+        # Far-future MSN => the client is out of sync; tell it to reload from
+        # scratch (400) rather than holding forever (6.2.5.2 resync trigger).
+        if st is not None:
+            building = st.get("building") or {}
+            window = st.get("window") or []
+            if building.get("seq") is not None:
+                last_seq = building["seq"]
+            elif window:
+                last_seq = window[-1]["seq"]
+            else:
+                last_seq = None
+            if last_seq is not None and target_msn > last_seq + 2:
+                return HttpResponse(status=400)
+
+        hold_target = st.get("target", 4) if st else 4
+        deadline = time.time() + min(3 * hold_target, 15)
+        available = bool(st and _hls_part_available(st, target_msn, target_part))
+        while not available and time.time() < deadline:
+            if _hls_session_gone(channel_id, client_id):
+                return JsonResponse({"error": "Stream stopped"}, status=410)
+            gevent.sleep(0.05)
             playlist_json = redis_client.get(playlist_key)
+            try:
+                st = json.loads(playlist_json) if playlist_json else None
+            except ValueError:
+                st = None
+            available = bool(st and _hls_part_available(st, target_msn, target_part))
+        if not available:
+            # Deadline hit (or the descriptor vanished mid-wait) without the
+            # requested MSN/part ever appearing: 503 so the client re-requests,
+            # never a 200 missing what it blocked on.
+            response = JsonResponse({"error": "Requested media not yet available"}, status=503)
+            response["Retry-After"] = "1"
+            return response
 
     from .output.hls.segmenter import render_media_playlist
     try:
@@ -1276,8 +1324,9 @@ def hls_playlist(request, channel_id, client_id):
             part_target=state.get("part_target", 0),
             parts_by_seq=state.get("parts"),
             building=state.get("building"),
+            adv_target=state.get("adv_target"),
         )
-    except (ValueError, KeyError) as e:
+    except (ValueError, KeyError, TypeError) as e:
         logger.error(f"[{client_id}] Malformed HLS playlist state for {channel_id}: {e}")
         return JsonResponse({"error": "Playlist unavailable"}, status=500)
 
@@ -1333,9 +1382,11 @@ def hls_part(request, channel_id, client_id, seq, part):
     """One Low-Latency HLS partial segment (a sub-slice of segment ``seq``).
 
     A part named by an #EXT-X-PRELOAD-HINT may be requested a beat before it is
-    published, so this blocks briefly (gevent-cooperative) waiting for it rather
-    than 404-ing, which is what lets a client ride the live edge with a blocking
-    GET on the next part."""
+    published, so for the in-progress segment this blocks briefly (gevent-
+    cooperative) waiting for it rather than 404-ing, which is what lets a client
+    ride the live edge with a blocking GET on the next part. A part of an
+    already-closed segment can never appear later, so it 404s immediately instead
+    of pinning a greenlet for the full timeout."""
     if not network_access_allowed(request, "STREAMS"):
         return Response({"error": "Forbidden"}, status=403)
 
@@ -1353,15 +1404,34 @@ def hls_part(request, channel_id, client_id, seq, part):
     if not redis_buffer:
         return JsonResponse({"error": "Proxy unavailable"}, status=503)
 
-    part_key = RedisKeys.output_part(channel_id, fmt, int(seq), int(part))
+    # The playlist descriptor (for the fast-404 building-segment check) lives in
+    # the main proxy Redis, not the segment-bytes buffer Redis above.
+    proxy_server = ProxyServer.get_instance()
+
+    seq_i, part_i = int(seq), int(part)
+    part_key = RedisKeys.output_part(channel_id, fmt, seq_i, part_i)
     data = redis_buffer.get(part_key)
     if not data:
-        deadline = time.time() + 3
-        while not data and time.time() < deadline:
-            if _hls_session_gone(channel_id, client_id):
-                return JsonResponse({"error": "Stream stopped"}, status=410)
-            gevent.sleep(0.03)
-            data = redis_buffer.get(part_key)
+        # Only the in-progress (building) segment's next part is worth a blocking
+        # wait: a PRELOAD-HINT can name it a beat before it is stored. A part of
+        # an already-closed segment either exists now or never will, so waiting
+        # 3s on it just pins a greenlet during client recovery. Fast-404 those.
+        should_wait = False
+        try:
+            pj = proxy_server.redis_client.get(RedisKeys.output_playlist(channel_id, fmt))
+            st = json.loads(pj) if pj else None
+        except (ValueError, TypeError):
+            st = None
+        if st:
+            b_seq = (st.get("building") or {}).get("seq")
+            should_wait = (b_seq is not None and seq_i == b_seq)
+        if should_wait:
+            deadline = time.time() + 3
+            while not data and time.time() < deadline:
+                if _hls_session_gone(channel_id, client_id):
+                    return JsonResponse({"error": "Stream stopped"}, status=410)
+                gevent.sleep(0.03)
+                data = redis_buffer.get(part_key)
     if not data:
         # Never produced (rolled off, or the segment closed before this part).
         return JsonResponse({"error": "Part expired"}, status=404)
