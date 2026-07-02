@@ -209,6 +209,15 @@ class ManagerLifecycleTests(unittest.TestCase):
         self.assertEqual(desc["adv_target"], 8)
         self.assertEqual(desc["part_target"], 0.56)  # frozen adv_part, not raw 0.5
 
+    def test_store_part_no_phantom_when_buffer_absent(self):
+        # A missing buffer Redis must not advertise a part whose bytes were never
+        # stored (every request for that URI would 404 after a 3s block).
+        self.m._store_segment(Segment(b"\x47" * 188, 4.0))  # anchor window
+        self.m.segment_buffer.redis_client = None
+        before = list(self.m._building_parts)
+        self.m._store_part(Part(b"\x47" * 188, 0.5, independent=True))
+        self.assertEqual(self.m._building_parts, before)  # not appended
+
     def test_atomic_publish_gate(self):
         # _store_part(publish=False) stores bytes but must not refresh the
         # descriptor (used for a final part whose closing segment publishes next).

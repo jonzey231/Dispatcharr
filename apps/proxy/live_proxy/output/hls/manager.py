@@ -268,18 +268,22 @@ class HLSOutputManager:
             self._building_seq = self.segment_buffer.index + 1
         part_index = len(self._building_parts)
         # Store parts in the same buffer Redis as the segment chunks so the part
-        # view reads them exactly like hls_segment reads chunks.
+        # view reads them exactly like hls_segment reads chunks. A missing buffer
+        # or a failed write must NOT append to _building_parts: the descriptor
+        # would then advertise a part whose bytes were never stored, and every
+        # request for that URI would 404 after a 3s block.
         buf = self.segment_buffer.redis_client
-        if buf:
-            try:
-                buf.setex(
-                    RedisKeys.output_part(self.channel_id, self.fmt, self._building_seq, part_index),
-                    PART_KEY_TTL,
-                    part.data,
-                )
-            except Exception as e:
-                logger.error(f"[HLS:{self.channel_id}] Error storing part: {e}")
-                return
+        if not buf:
+            return
+        try:
+            buf.setex(
+                RedisKeys.output_part(self.channel_id, self.fmt, self._building_seq, part_index),
+                PART_KEY_TTL,
+                part.data,
+            )
+        except Exception as e:
+            logger.error(f"[HLS:{self.channel_id}] Error storing part: {e}")
+            return
         self._building_parts.append([round(part.duration, 5), bool(part.independent)])
         # Publish only once a full segment anchors the window: a descriptor with
         # an empty window renders a degenerate zero-segment playlist AVPlayer will

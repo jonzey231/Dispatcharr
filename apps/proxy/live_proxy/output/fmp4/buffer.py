@@ -79,6 +79,17 @@ class FMP4StreamBuffer:
             return True
         except Exception as e:
             logger.error(f"[fMP4Buffer:{self.channel_id}] Error putting fragment: {e}")
+            # The INCR may have advanced the shared index even though the chunk
+            # write failed; resync self.index to Redis so the caller does not
+            # attribute the next fragment (and, for HLS, its parts) to a stale
+            # sequence number. Best-effort; leave self.index untouched if Redis
+            # is unreachable.
+            try:
+                current = self.redis_client.get(self.buffer_index_key)
+                if current is not None:
+                    self.index = int(current)
+            except Exception:
+                pass
             return False
 
     def get_chunks(self, start_index=None):

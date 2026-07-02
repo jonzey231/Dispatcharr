@@ -44,6 +44,26 @@ from apps.proxy.utils import check_user_stream_limits
 
 logger = get_logger()
 
+from gevent.lock import BoundedSemaphore
+
+# Bound concurrent Low-Latency blocking holds (playlist Blocking Reload + part
+# waits) per channel so the AllowAny HLS endpoints cannot be driven to
+# greenlet/Redis exhaustion by thousands of simultaneous multi-second holds;
+# excess requests get a fast 503 Retry-After rather than piling up. Sized well
+# above a realistic per-channel LL viewer count (each holds at most one reload +
+# one part at a time).
+HLS_MAX_CONCURRENT_HOLDS = 128
+_HLS_HOLD_SEMAPHORES = {}
+
+
+def _hls_hold_semaphore(channel_id):
+    """Per-channel gevent semaphore gating concurrent LL blocking holds."""
+    sem = _HLS_HOLD_SEMAPHORES.get(channel_id)
+    if sem is None:
+        sem = BoundedSemaphore(HLS_MAX_CONCURRENT_HOLDS)
+        _HLS_HOLD_SEMAPHORES[channel_id] = sem
+    return sem
+
 
 def _channel_stopping_response():
     response = JsonResponse(
@@ -1090,12 +1110,18 @@ def _hls_resolved_format(client_hash):
     return f"hls:p{profile_id}" if profile_id else "hls"
 
 
-def _hls_touch_client(channel_id, client_id):
+def _hls_touch_client(channel_id, client_id, allow_create=True):
     """
     Refresh the client's activity record; returns the client hash, or a
     freshly re-registered minimal hash when the record lapsed while the
     channel is still running (e.g. a player paused longer than the ghost
     window and then resumed).
+
+    ``allow_create`` must be True only for playlist requests. Segment/part
+    requests pass False so a wedged player's retry loop can neither resurrect a
+    stopped channel nor keep an upstream provisioned forever; and even a playlist
+    request only re-registers while the channel's HLS output owner lock is held,
+    so a request for a channel whose output has stopped is not resurrected.
     """
     from .config_helper import ConfigHelper
 
@@ -1110,6 +1136,14 @@ def _hls_touch_client(channel_id, client_id):
     now = str(time.time())
 
     client_hash = redis_client.hgetall(client_key)
+    if not client_hash:
+        # Absent/lapsed record. Only (re-)register on a playlist request for a
+        # channel whose HLS output is still owned; otherwise refuse rather than
+        # provision an upstream off a stray segment/part poll.
+        if not allow_create:
+            return None
+        if not redis_client.get(RedisKeys.output_owner(channel_id, "hls")):
+            return None
     pipe = redis_client.pipeline(transaction=False)
     if not client_hash:
         # Lapsed client returning to a live channel: re-register minimally.
@@ -1281,18 +1315,30 @@ def hls_playlist(request, channel_id, client_id):
                 return HttpResponse(status=400)
 
         hold_target = st.get("target", 4) if st else 4
-        deadline = time.time() + min(3 * hold_target, 15)
         available = bool(st and _hls_part_available(st, target_msn, target_part))
-        while not available and time.time() < deadline:
-            if _hls_session_gone(channel_id, client_id):
-                return JsonResponse({"error": "Stream stopped"}, status=410)
-            gevent.sleep(0.05)
-            playlist_json = redis_client.get(playlist_key)
+        if not available:
+            # Bound concurrent blocking holds per channel so a flood of blocking
+            # reloads cannot exhaust greenlets/Redis; shed with a fast 503 when
+            # the channel is already at its hold ceiling.
+            sem = _hls_hold_semaphore(channel_id)
+            if not sem.acquire(blocking=False):
+                response = JsonResponse({"error": "Server busy, retry"}, status=503)
+                response["Retry-After"] = "1"
+                return response
             try:
-                st = json.loads(playlist_json) if playlist_json else None
-            except ValueError:
-                st = None
-            available = bool(st and _hls_part_available(st, target_msn, target_part))
+                deadline = time.time() + min(3 * hold_target, 15)
+                while not available and time.time() < deadline:
+                    if _hls_session_gone(channel_id, client_id):
+                        return JsonResponse({"error": "Stream stopped"}, status=410)
+                    gevent.sleep(0.05)
+                    playlist_json = redis_client.get(playlist_key)
+                    try:
+                        st = json.loads(playlist_json) if playlist_json else None
+                    except ValueError:
+                        st = None
+                    available = bool(st and _hls_part_available(st, target_msn, target_part))
+            finally:
+                sem.release()
         if not available:
             # Deadline hit (or the descriptor vanished mid-wait) without the
             # requested MSN/part ever appearing: 503 so the client re-requests,
@@ -1346,7 +1392,7 @@ def hls_segment(request, channel_id, client_id, seq):
     if _hls_session_gone(channel_id, client_id):
         return JsonResponse({"error": "Stream stopped"}, status=410)
 
-    client_hash = _hls_touch_client(channel_id, client_id)
+    client_hash = _hls_touch_client(channel_id, client_id, allow_create=False)
     if client_hash is None:
         return JsonResponse({"error": "Proxy unavailable"}, status=503)
 
@@ -1393,7 +1439,7 @@ def hls_part(request, channel_id, client_id, seq, part):
     if _hls_session_gone(channel_id, client_id):
         return JsonResponse({"error": "Stream stopped"}, status=410)
 
-    client_hash = _hls_touch_client(channel_id, client_id)
+    client_hash = _hls_touch_client(channel_id, client_id, allow_create=False)
     if client_hash is None:
         return JsonResponse({"error": "Proxy unavailable"}, status=503)
 
@@ -1426,12 +1472,22 @@ def hls_part(request, channel_id, client_id, seq, part):
             b_seq = (st.get("building") or {}).get("seq")
             should_wait = (b_seq is not None and seq_i == b_seq)
         if should_wait:
-            deadline = time.time() + 3
-            while not data and time.time() < deadline:
-                if _hls_session_gone(channel_id, client_id):
-                    return JsonResponse({"error": "Stream stopped"}, status=410)
-                gevent.sleep(0.03)
-                data = redis_buffer.get(part_key)
+            # Share the per-channel hold budget with the playlist Blocking Reload
+            # so part waits cannot exhaust greenlets independently; shed fast.
+            sem = _hls_hold_semaphore(channel_id)
+            if not sem.acquire(blocking=False):
+                response = JsonResponse({"error": "Server busy, retry"}, status=503)
+                response["Retry-After"] = "1"
+                return response
+            try:
+                deadline = time.time() + 3
+                while not data and time.time() < deadline:
+                    if _hls_session_gone(channel_id, client_id):
+                        return JsonResponse({"error": "Stream stopped"}, status=410)
+                    gevent.sleep(0.03)
+                    data = redis_buffer.get(part_key)
+            finally:
+                sem.release()
     if not data:
         # Never produced (rolled off, or the segment closed before this part).
         return JsonResponse({"error": "Part expired"}, status=404)
